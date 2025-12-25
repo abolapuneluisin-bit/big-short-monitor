@@ -435,7 +435,7 @@
     <script>
         // --- State Management ---
         let state = {
-            isDemoMode: false, // Default to Live if possible
+            isDemoMode: false,
             apiKeys: {
                 alphaVantage: '',
                 finnhub: ''
@@ -443,8 +443,9 @@
             data: {
                 qqqPrice: 482.12,
                 qqqChange: -1.42,
-                tbillYield: 4.21,
-                tbillChange: 0.05,
+                tbillYield: 4.21, // 10Y
+                irxYield: 4.35,   // 13 Week T-Bill (New)
+                yieldSpread: -0.14, // 10Y - 13W
                 buffettIndicator: 198.4,
                 rsi: 68.4,
                 sma200: 442.50,
@@ -458,6 +459,11 @@
         // --- Data Fetching Logic ---
         const PROXY = 'https://corsproxy.io/?';
         const YAHOO_BASE = 'https://query1.finance.yahoo.com/v8/finance/chart/';
+
+        // Helper to normalize Yahoo Bond Indices (often x10, e.g. 42.1 = 4.21%)
+        function normalizeYield(val) {
+            return val > 20 ? val / 10 : val;
+        }
 
         async function fetchMarketData() {
             if (state.isDemoMode) return;
@@ -484,18 +490,27 @@
                 // 2. Fetch 10Y Yield (^TNX)
                 const tnxRes = await fetch(`${PROXY}${encodeURIComponent(YAHOO_BASE + '^TNX')}`);
                 const tnxData = await tnxRes.json();
-                state.data.tbillYield = tnxData.chart.result[0].meta.regularMarketPrice;
-                state.data.tbillChange = state.data.tbillYield - tnxData.chart.result[0].meta.previousClose;
+                state.data.tbillYield = normalizeYield(tnxData.chart.result[0].meta.regularMarketPrice);
+                state.data.tbillChange = state.data.tbillYield - normalizeYield(tnxData.chart.result[0].meta.previousClose);
 
-                // 3. Fetch VIX (^VIX)
+                // 3. Fetch 13-Week T-Bill (^IRX) - Short Term Proxy
+                const irxRes = await fetch(`${PROXY}${encodeURIComponent(YAHOO_BASE + '^IRX')}`);
+                const irxData = await irxRes.json();
+                state.data.irxYield = normalizeYield(irxData.chart.result[0].meta.regularMarketPrice);
+
+                // 4. Fetch VIX (^VIX)
                 const vixRes = await fetch(`${PROXY}${encodeURIComponent(YAHOO_BASE + '^VIX')}`);
                 const vixData = await vixRes.json();
                 state.data.vix = vixData.chart.result[0].meta.regularMarketPrice;
 
-                log(`Live Data Sync: QQQ @ $${state.data.qqqPrice.toFixed(2)} | VIX @ ${state.data.vix.toFixed(2)}`);
+                // Calculate Spread (10Y - 13W)
+                state.data.yieldSpread = state.data.tbillYield - state.data.irxYield;
+
+                log(`Live Data Sync: QQQ @ $${state.data.qqqPrice.toFixed(2)} | Spread: ${state.data.yieldSpread.toFixed(2)}%`);
                 calculateCrashScore();
             } catch (err) {
-                log('API ERR: Connection throttled. Switching to Demo Mode.');
+                console.error(err);
+                log('API ERR: Connection throttled or Failed. Switching to Demo Mode.');
                 state.isDemoMode = true;
                 updateUI();
             }
@@ -505,26 +520,41 @@
 
         function calculateCrashScore() {
             let score = 0;
+            const reasons = [];
 
-            // 1. Buffett Proxy (approximation based on QQQ/SMA distance + yield)
+            // 1. Yield Curve Inversion (THE BIG ONE)
+            // If Short Term (IRX) > Long Term (TNX), Spread is negative.
+            // This is the strongest recession signal.
+            if (state.data.yieldSpread < 0) {
+                score += 40; // Massive weight for inversion
+                reasons.push('YIELD CURVE INVERTED');
+            } else if (state.data.yieldSpread < 0.2) {
+                score += 20; // FLATTENING
+                reasons.push('Yield Curve Flat');
+            }
+
+            // 2. Buffett Proxy (approximation based on QQQ/SMA distance)
             const smaDistance = ((state.data.qqqPrice - state.data.sma200) / state.data.sma200) * 100;
-            if (smaDistance > 15) score += 30; // Overextended
-            else if (smaDistance > 10) score += 15;
+            if (smaDistance > 20) {
+                score += 20;
+                reasons.push('Overextended vs SMA');
+            } else if (smaDistance > 10) score += 10;
 
-            // 2. VIX Weight (Volatility Fear)
-            if (state.data.vix > 30) score += 35;
-            else if (state.data.vix > 20) score += 20;
-            else if (state.data.vix > 15) score += 10;
+            // 3. VIX Weight (Volatility Fear)
+            if (state.data.vix > 35) {
+                score += 30;
+                reasons.push('Extreme Fear (VIX)');
+            } else if (state.data.vix > 20) score += 15;
 
-            // 3. Yield Pressure
-            if (state.data.tbillYield > 4.8) score += 25;
-            else if (state.data.tbillYield > 4.2) score += 15;
+            // 4. Absolute Yield Pressure
+            if (state.data.tbillYield > 5.0) {
+                score += 10;
+                reasons.push('Yields Critical > 5%');
+            }
 
-            // 4. Momentum (RSI simulated if not fully calculated)
-            if (state.data.qqqChange < -2) score += 10;
+            state.data.crashScore = Math.min(Math.round(score), 100);
 
-            state.data.crashScore = Math.min(Math.round(score + 10), 100); // 10 base risk
-
+            // Text Sentiment
             if (state.data.crashScore > 75) state.data.sentiment = 'CRITICAL';
             else if (state.data.crashScore > 50) state.data.sentiment = 'FEARFUL';
             else if (state.data.crashScore > 30) state.data.sentiment = 'NERVOUS';
@@ -555,7 +585,20 @@
 
             document.getElementById('tbill-yield').innerHTML = `${state.data.tbillYield.toFixed(2)}<span class="text-lg font-normal">%</span>`;
             document.getElementById('tbill-change').innerText = `${state.data.tbillChange > 0 ? '+' : ''}${state.data.tbillChange.toFixed(2)}`;
-            document.getElementById('tbill-change').className = `text-xs font-bold ${state.data.tbillChange <= 0 ? 'text-cyber-success' : 'text-cyber-danger'}`;
+
+            // Yield Curve Status Update
+            const curveStatus = document.getElementById('curve-status');
+            const spreadVal = state.data.yieldSpread;
+            if (spreadVal < 0) {
+                curveStatus.innerText = `INVERTED (${spreadVal.toFixed(2)}%)`;
+                curveStatus.className = 'text-cyber-danger font-bold animate-pulse';
+            } else if (spreadVal < 0.2) {
+                curveStatus.innerText = `FLAT (${spreadVal.toFixed(2)}%)`;
+                curveStatus.className = 'text-cyber-warning font-bold';
+            } else {
+                curveStatus.innerText = `NORMAL (+${spreadVal.toFixed(2)}%)`;
+                curveStatus.className = 'text-cyber-success font-bold';
+            }
 
             document.getElementById('sma-val').innerText = `$${state.data.sma200.toFixed(2)}`;
 
@@ -584,7 +627,7 @@
             document.getElementById('sentiment-val').innerText = state.data.sentiment;
 
             if (isSniper) {
-                log('CRITICAL ALERT: Market instability detected. Score exceeding 75%.');
+                log('CRITICAL ALERT: Market instability detected. Yield Curve/VIX Critical.');
                 playAlert();
             }
         }
@@ -650,7 +693,11 @@
             state.data.qqqPrice += (Math.random() - 0.5) * 0.5;
             state.data.qqqChange = (Math.random() - 0.5) * 2;
             state.data.tbillYield += (Math.random() - 0.5) * 0.01;
+            state.data.irxYield += (Math.random() - 0.5) * 0.01;
             state.data.vix += (Math.random() - 0.5);
+
+            // Recalculate spread in demo mode
+            state.data.yieldSpread = state.data.tbillYield - state.data.irxYield;
 
             calculateCrashScore();
             addEntropyBar();
